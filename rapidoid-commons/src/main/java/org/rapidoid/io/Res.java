@@ -84,7 +84,7 @@ public class Res extends RapidoidThing {
 
 	private static void validateFilename(String filename) {
         // fix for exposing resource name
-        U.must(!filename.endsWith("..html"), "Invalid Request", ".");
+        U.must(!filename.endsWith("..html"), "Invalid Request", "");
 		U.must(!Res.REGEX_INVALID_FILENAME.matcher(filename).find(), "Invalid resource name: %s", filename);
 	}
 
