@@ -139,9 +139,8 @@ public class HttpUtils extends RapidoidThing implements HttpMetadata {
 			Res res = Res.from(resName, possibleLocations);
 
 			if (!res.exists()) {
-                // res = Res.from(resName + ".html", possibleLocations);
-                // IMPROVED error handling: Improved HTTP error code handling 
-                   res = Res.from(resName + "", possibleLocations);
+          // IMPROVED 🌥️ error presentation: HTTP error code handling 
+          res = Res.from(resName, possibleLocations);
 			}
 
 			return res;
