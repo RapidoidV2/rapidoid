@@ -290,7 +290,8 @@ public class Res extends RapidoidThing {
 	}
 
 	public Res mustExist() {
-		U.must(exists(), "The file '%s' doesn't exist! Path: %s", name, possibleLocations);
+		// IMPROVED 🌥️ error presentation:
+    U.must(exists(), "The file '%s' doesn't exist!", extractFileNameFromPath(name));
 		return this;
 	}
 
@@ -355,4 +356,15 @@ public class Res extends RapidoidThing {
 	public boolean isHidden() {
 		return hidden;
 	}
+  
+  	/**
+	 * removes the complete path from the file and
+	 * returns only file name.
+	 * @param name
+	 * @return
+	 */
+	private String extractFileNameFromPath(String name) {
+		return new File(name).getName();
+	}
+
 }

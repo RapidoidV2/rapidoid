@@ -41,11 +41,13 @@ import java.util.Map;
 @Since("2.0.0")
 public class IO extends RapidoidThing {
 
-	public static URL resource(String filename) {
+  // IMPROVED 🔒security:
+	private static URL resource(String filename) {
 		return classLoader().getResource(filename);
 	}
 
-	public static InputStream resourceAsStream(String filename) {
+  // IMPROVED 🔒security:
+	private static InputStream resourceAsStream(String filename) {
 		return classLoader().getResourceAsStream(filename.replace('\\', '/'));
 	}
 
@@ -132,11 +134,17 @@ public class IO extends RapidoidThing {
 
 		return output.toByteArray();
 	}
-
-	public static String loadResourceAsString(String filename) {
-		byte[] bytes = loadBytes(filename);
-		return bytes != null ? new String(bytes) : null;
-	}
+  
+  // IMPROVED 🔒security:  
+  /**
+	 * this method is never used so commented
+	 * @param filename
+	 * @return
+	 */    
+//	public static String loadResourceAsString(String filename) {
+//		byte[] bytes = loadBytes(filename);
+//		return bytes != null ? new String(bytes) : null;
+//	}
 
 	public static byte[] loadBytes(String filename) {
 		InputStream input = null;
