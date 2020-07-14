@@ -41,12 +41,16 @@ import java.util.Map;
 @Since("2.0.0")
 public class IO extends RapidoidThing {
 
-  // IMPROVED 🔒security:
+  // IMPROVED 🔒security: fixed issue of getting the full path of 
+  // a server side resource to the client. Hence changed the package
+  // visibility to 'private'
 	private static URL resource(String filename) {
 		return classLoader().getResource(filename);
 	}
 
-  // IMPROVED 🔒security:
+  // fixed issue of getting the full path of 
+  // a server side resource to the client. Hence changed the package
+  // visibility to 'private'
 	private static InputStream resourceAsStream(String filename) {
 		return classLoader().getResourceAsStream(filename.replace('\\', '/'));
 	}
@@ -135,7 +139,7 @@ public class IO extends RapidoidThing {
 		return output.toByteArray();
 	}
   
-  // IMPROVED 🔒security:  
+    
   /**
 	 * this method is never used so commented
 	 * @param filename
