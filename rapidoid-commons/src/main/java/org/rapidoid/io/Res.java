@@ -47,7 +47,7 @@ public class Res extends RapidoidThing {
 
 	public static volatile Pattern REGEX_INVALID_FILENAME = Pattern.compile("(?:[*?'\"<>|\\x00-\\x1F]|\\.\\.)");
 
-	private static final ConcurrentMap<ResKey, Res> FILES = Coll.concurrentMap();
+//	private static final ConcurrentMap<ResKey, Res> FILES = Coll.concurrentMap();
 
 	public static final ScheduledThreadPoolExecutor EXECUTOR = new ScheduledThreadPoolExecutor(1);
 
@@ -74,6 +74,27 @@ public class Res extends RapidoidThing {
 	private volatile boolean hidden;
 
 	private final Map<String, Runnable> changeListeners = Coll.synchronizedMap();
+
+  ///// the following declarations are used for cache implementation
+  private static volatile int placeInLine = -1;
+  private static AtomicInteger circularLinePos = new AtomicInteger(0);
+  private static ReadWriteLock circularLock = new ReentrantReadWriteLock();
+  private static AtomicInteger cachedFilesCount = new AtomicInteger(0);
+  private static int EXPECTED_ENTRIES = 256;
+  private static float LOAD_FACTOR = 0.5F;
+  private static int CONCURRENCY_LEVEL = 4;
+
+  private static volatile int MAX_CACHE_SIZE = 67108864; // 64MB
+  private static volatile int MIN_CACHE_SIZE = 4194304; //4 MB
+  private static volatile int MAX_FILE_IN_CACHE = 1048576; // 1MB
+  private static LongAdder sizeOfCachedFiles = new LongAdder();
+  private static volatile Res[] circularLineQueue = new Res[4096];
+
+  private static final ConcurrentHashMap<String, Res> FILES
+                    = new ConcurrentHashMap<String, Res>(
+                    EXPECTED_ENTRIES,
+                    LOAD_FACTOR,
+                    CONCURRENCY_LEVEL);
 
 	private Res(String name, String... possibleLocations) {
 		this.name = name;
@@ -130,26 +151,110 @@ public class Res extends RapidoidThing {
 		return create(filename, possibleLocations);
 	}
 
+  // IMPROVED Scalability: Added cache implementation 
 	private static Res create(String filename, String... possibleLocations) {
 		for (int i = 0; i < possibleLocations.length; i++) {
 			possibleLocations[i] = Msc.refinePath(possibleLocations[i]);
 		}
 
-		ResKey key = new ResKey(filename, possibleLocations);
+    if(0 <possibleLocations.length) {
+        for(int i = 0, len = possibleLocations.length; i<len; i++) {
+            Res found = FILES.get(Msc.path(possibleLocations[i], filename));
+            if(found != null) {
+                               updatePlaceInLine( found );
+                               return found;
+            }
+        }
+        }else {
+                Res found = FILES.get(filename);
+                if(found != null) {
+                        updatePlaceInLine(found);
+                        return found;
+                }
+        }
+
+//		ResKey key = new ResKey(filename, possibleLocations);
 
 		Res cachedFile = FILES.get(key);
 
 		if (cachedFile == null) {
 			cachedFile = new Res(filename, possibleLocations);
 
-			if (FILES.size() < 1000) {
+    FILES.putIfAbsent(filename, cachedFile);
+    
+			//if (FILES.size() < 1000) {
 				// FIXME use real cache with proper expiration
-				FILES.putIfAbsent(key, cachedFile);
-			}
+				//FILES.putIfAbsent(key, cachedFile);
+			//}
 		}
 
 		return cachedFile;
 	}
+
+  /*
+   * This method updates the 'Res' object into the circular buffer
+   * If there is an existing entry, it will invalidate it and updates
+   * with the current one.
+   */ 
+  private static void updatePlaceInLine(Res res) {
+    Lock reader = circularLock.readLock();
+    reader.lock();
+    try {
+          do {
+                  int newPos    = circularLinePos.getAndIncrement();
+                  newPos        = newPos % circularLineQueue.length;
+                  Res oldObject = circularLineQueue[newPos];
+                  if(oldObject != null) {
+                     long cacheSizeSum = sizeOfCachedFiles.sum();
+                     boolean cacheSizeTooSmall = cacheSizeSum < MIN_CACHE_SIZE;
+                     boolean cacheProjectionSmallEnough = cacheSizeSum * circularLineQueue.length <= MAX_FILE_IN_CACHE * cachedFilesCount.getAndIncrement();
+                     if(cacheSizeTooSmall || cacheProjectionSmallEnough) {
+                             reader.unlock();
+                             resizeCircularArray();
+                             reader.lock();
+                             continue;
+                     }
+                     oldObject.invalidate();
+                  }
+                  circularLineQueue[newPos] = res;
+                  if(placeInLine != -1) circularLineQueue[placeInLine] = null;
+                  placeInLine = newPos;
+          }while(false);
+        }finally {
+              reader.unlock();
+        }
+  }
+
+  /*
+   * This method will resize the circular buffer
+   *
+   */
+  private static void resizeCircularArray() {
+    Lock writer = circularLock.writeLock();
+    writer.lock();
+    try {
+          int oldLength = circularLineQueue.length;
+          Res[] newCircularLineQueue = new Res[oldLength >>1 + oldLength];
+
+          int currentPos = circularLinePos.get(), toPos = 0;
+          currentPos = currentPos % oldLength;
+          for(int from = currentPos; from != currentPos; ) {
+              Res oldCachedRes = circularLineQueue[from];
+              if( oldCachedRes != null) {
+                    newCircularLineQueue[toPos] = oldCachedRes;
+                    oldCachedRes.setPlaceInLine(toPos);
+                    ++toPos;
+              }
+              if(++from == oldLength) from = 0;
+          }
+          
+          circularLinePos.set(toPos);
+          circularLineQueue = newCircularLineQueue;
+          
+          }finally {
+                  writer.unlock();
+          }
+  }
 
 	public synchronized byte[] getBytes() {
 		loadResource();
