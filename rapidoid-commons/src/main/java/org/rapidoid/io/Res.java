@@ -258,7 +258,6 @@ public class Res extends RapidoidThing {
         }
     }
 
-
     /*
      * This method will resize the circular buffer
      *
