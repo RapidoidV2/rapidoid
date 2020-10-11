@@ -36,441 +36,508 @@ import java.io.StringReader;
 import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.Map;
-import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Pattern;
 
 @Authors("Nikolche Mihajlovski")
 @Since("4.1.0")
 public class Res extends RapidoidThing {
 
-	public static volatile Pattern REGEX_INVALID_FILENAME = Pattern.compile("(?:[*?'\"<>|\\x00-\\x1F]|\\.\\.)");
+    public static final ScheduledThreadPoolExecutor EXECUTOR = new ScheduledThreadPoolExecutor(1);
 
-//	private static final ConcurrentMap<ResKey, Res> FILES = Coll.concurrentMap();
+    //	private static final ConcurrentMap<ResKey, Res> FILES = Coll.concurrentMap();
+    private static final String[] DEFAULT_LOCATIONS = {""};
+    public static volatile Pattern REGEX_INVALID_FILENAME = Pattern.compile("(?:[*?'\"<>|\\x00-\\x1F]|\\.\\.)");
+    ///// the following declarations are used for cache implementation
+    private static volatile int placeInLine = -1;
+    private static AtomicInteger circularLinePos = new AtomicInteger(0);
+    private static ReadWriteLock circularLock = new ReentrantReadWriteLock();
+    private static AtomicInteger cachedFilesCount = new AtomicInteger(0);
+    private static int EXPECTED_ENTRIES = 256;
+    private static float LOAD_FACTOR = 0.5F;
+    private static int CONCURRENCY_LEVEL = 4;
+    private static final ConcurrentHashMap<String, Res> FILES
+            = new ConcurrentHashMap<String, Res>(
+            EXPECTED_ENTRIES,
+            LOAD_FACTOR,
+            CONCURRENCY_LEVEL);
+    private static volatile int MAX_CACHE_SIZE = 67108864; // 64MB
+    private static volatile int MIN_CACHE_SIZE = 4194304; //4 MB
+    private static volatile int MAX_FILE_IN_CACHE = 1048576; // 1MB
+    private static LongAdder sizeOfCachedFiles = new LongAdder();
+    private static volatile Res[] circularLineQueue = new Res[4096];
+    private final String name;
+    private final String[] possibleLocations;
+    private final Map<String, Runnable> changeListeners = Coll.synchronizedMap();
+    private volatile byte[] bytes;
+    private volatile long lastUpdatedOn;
+    private volatile long lastModified;
+    private volatile String content;
+    private volatile boolean trackingChanges;
+    private volatile String cachedFileName;
+    private volatile Object attachment;
+    private volatile boolean hidden;
+    private volatile ScheduledFuture filePollingTask = null;
 
-	public static final ScheduledThreadPoolExecutor EXECUTOR = new ScheduledThreadPoolExecutor(1);
+    private Res(String name, String... possibleLocations) {
+        this.name = name;
+        this.possibleLocations = possibleLocations;
 
-	private static final String[] DEFAULT_LOCATIONS = {""};
+        validateFilename(name);
+    }
 
-	private final String name;
-
-	private final String[] possibleLocations;
-
-	private volatile byte[] bytes;
-
-	private volatile long lastUpdatedOn;
-
-	private volatile long lastModified;
-
-	private volatile String content;
-
-	private volatile boolean trackingChanges;
-
-	private volatile String cachedFileName;
-
-	private volatile Object attachment;
-
-	private volatile boolean hidden;
-
-	private final Map<String, Runnable> changeListeners = Coll.synchronizedMap();
-
-  ///// the following declarations are used for cache implementation
-  private static volatile int placeInLine = -1;
-  private static AtomicInteger circularLinePos = new AtomicInteger(0);
-  private static ReadWriteLock circularLock = new ReentrantReadWriteLock();
-  private static AtomicInteger cachedFilesCount = new AtomicInteger(0);
-  private static int EXPECTED_ENTRIES = 256;
-  private static float LOAD_FACTOR = 0.5F;
-  private static int CONCURRENCY_LEVEL = 4;
-
-  private static volatile int MAX_CACHE_SIZE = 67108864; // 64MB
-  private static volatile int MIN_CACHE_SIZE = 4194304; //4 MB
-  private static volatile int MAX_FILE_IN_CACHE = 1048576; // 1MB
-  private static LongAdder sizeOfCachedFiles = new LongAdder();
-  private static volatile Res[] circularLineQueue = new Res[4096];
-
-  private static final ConcurrentHashMap<String, Res> FILES
-                    = new ConcurrentHashMap<String, Res>(
-                    EXPECTED_ENTRIES,
-                    LOAD_FACTOR,
-                    CONCURRENCY_LEVEL);
-
-	private Res(String name, String... possibleLocations) {
-		this.name = name;
-		this.possibleLocations = possibleLocations;
-
-		validateFilename(name);
-	}
-
-	private static void validateFilename(String filename) {
+    private static void validateFilename(String filename) {
         // fix for exposing resource name
         U.must(!filename.endsWith("..html"), "Invalid Request", "");
-		U.must(!Res.REGEX_INVALID_FILENAME.matcher(filename).find(), "Invalid resource name: %s", filename);
-	}
+        U.must(!Res.REGEX_INVALID_FILENAME.matcher(filename).find(), "Invalid resource name: %s", filename);
+    }
 
-	public static Res from(File file, String... possibleLocations) {
-		U.must(!file.isAbsolute() || U.isEmpty(possibleLocations), "Cannot specify locations for an absolute filename!");
-		return file.isAbsolute() ? absolute(file) : relative(file.getPath(), possibleLocations);
-	}
+    public static Res from(File file, String... possibleLocations) {
+        U.must(!file.isAbsolute() || U.isEmpty(possibleLocations), "Cannot specify locations for an absolute filename!");
+        return file.isAbsolute() ? absolute(file) : relative(file.getPath(), possibleLocations);
+    }
 
-	public static Res from(String filename, String... possibleLocations) {
-		return from(new File(filename), possibleLocations);
-	}
+    public static Res from(String filename, String... possibleLocations) {
+        return from(new File(filename), possibleLocations);
+    }
 
-	private static Res absolute(File file) {
-		return create(file.getAbsolutePath());
-	}
+    private static Res absolute(File file) {
+        return create(file.getAbsolutePath());
+    }
 
-	private static Res relative(String filename, String... possibleLocations) {
-		File file = new File(filename);
+    private static Res relative(String filename, String... possibleLocations) {
+        File file = new File(filename);
 
-		if (file.isAbsolute()) {
-			return absolute(file);
-		}
+        if (file.isAbsolute()) {
+            return absolute(file);
+        }
 
-		if (U.isEmpty(possibleLocations)) {
-			possibleLocations = DEFAULT_LOCATIONS;
-		}
+        if (U.isEmpty(possibleLocations)) {
+            possibleLocations = DEFAULT_LOCATIONS;
+        }
 
-		U.must(!U.isEmpty(filename), "Resource filename must be specified!");
-		U.must(!file.isAbsolute(), "Expected relative filename!");
+        U.must(!U.isEmpty(filename), "Resource filename must be specified!");
+        U.must(!file.isAbsolute(), "Expected relative filename!");
 
-		String root = Env.root();
-		if (U.notEmpty(Env.root())) {
-			String[] loc = new String[possibleLocations.length * 2];
+        String root = Env.root();
+        if (U.notEmpty(Env.root())) {
+            String[] loc = new String[possibleLocations.length * 2];
 
-			for (int i = 0; i < possibleLocations.length; i++) {
-				loc[2 * i] = Msc.path(root, possibleLocations[i]);
-				loc[2 * i + 1] = possibleLocations[i];
-			}
+            for (int i = 0; i < possibleLocations.length; i++) {
+                loc[2 * i] = Msc.path(root, possibleLocations[i]);
+                loc[2 * i + 1] = possibleLocations[i];
+            }
 
-			possibleLocations = loc;
-		}
+            possibleLocations = loc;
+        }
 
-		return create(filename, possibleLocations);
-	}
+        return create(filename, possibleLocations);
+    }
 
-  // IMPROVED Scalability: Added cache implementation 
-	private static Res create(String filename, String... possibleLocations) {
-		for (int i = 0; i < possibleLocations.length; i++) {
-			possibleLocations[i] = Msc.refinePath(possibleLocations[i]);
-		}
+    // IMPROVED Scalability: Added cache implementation
+    private static Res create(String filename, String... possibleLocations) {
+        for (int i = 0; i < possibleLocations.length; i++) {
+            possibleLocations[i] = Msc.refinePath(possibleLocations[i]);
+        }
 
-    if(0 <possibleLocations.length) {
-        for(int i = 0, len = possibleLocations.length; i<len; i++) {
-            Res found = FILES.get(Msc.path(possibleLocations[i], filename));
-            if(found != null) {
-                               updatePlaceInLine( found );
-                               return found;
+        Res found = null;
+        if (0 < possibleLocations.length) {
+            for (int i = 0, len = possibleLocations.length; i < len; i++) {
+                found = FILES.get(Msc.path(possibleLocations[i], filename));
+                if (found != null) {
+                    updatePlaceInLine(found);
+                    return found;
+                }
+
+            }
+        } else {
+            found = FILES.get(filename);
+            if (found != null) {
+                updatePlaceInLine(found);
+                return found;
             }
         }
-        }else {
-                Res found = FILES.get(filename);
-                if(found != null) {
-                        updatePlaceInLine(found);
-                        return found;
-                }
+
+        if (found == null) {
+            // calculate the 'Res' to FILES map
+            found = updateRes(filename, possibleLocations);
         }
 
 //		ResKey key = new ResKey(filename, possibleLocations);
+        //Res cachedFile = FILES.get(filename);
+        //if (cachedFile == null) {
+        //	cachedFile = new Res(filename, possibleLocations);
+        //FILES.putIfAbsent(filename, cachedFile);
+        //if (FILES.size() < 1000) {
+        //		// FIXME use real cache with proper expiration
+        //FILES.putIfAbsent(key, cachedFile);
+        //}
+        //}
 
-		Res cachedFile = FILES.get(key);
+        return found;
+    }
 
-		if (cachedFile == null) {
-			cachedFile = new Res(filename, possibleLocations);
-
-    FILES.putIfAbsent(filename, cachedFile);
-    
-			//if (FILES.size() < 1000) {
-				// FIXME use real cache with proper expiration
-				//FILES.putIfAbsent(key, cachedFile);
-			//}
-		}
-
-		return cachedFile;
-	}
-
-  /*
-   * This method updates the 'Res' object into the circular buffer
-   * If there is an existing entry, it will invalidate it and updates
-   * with the current one.
-   */ 
-  private static void updatePlaceInLine(Res res) {
-    Lock reader = circularLock.readLock();
-    reader.lock();
-    try {
-          do {
-                  int newPos    = circularLinePos.getAndIncrement();
-                  newPos        = newPos % circularLineQueue.length;
-                  Res oldObject = circularLineQueue[newPos];
-                  if(oldObject != null) {
-                     long cacheSizeSum = sizeOfCachedFiles.sum();
-                     boolean cacheSizeTooSmall = cacheSizeSum < MIN_CACHE_SIZE;
-                     boolean cacheProjectionSmallEnough = cacheSizeSum * circularLineQueue.length <= MAX_FILE_IN_CACHE * cachedFilesCount.getAndIncrement();
-                     if(cacheSizeTooSmall || cacheProjectionSmallEnough) {
-                             reader.unlock();
-                             resizeCircularArray();
-                             reader.lock();
-                             continue;
-                     }
-                     oldObject.invalidate();
-                  }
-                  circularLineQueue[newPos] = res;
-                  if(placeInLine != -1) circularLineQueue[placeInLine] = null;
-                  placeInLine = newPos;
-          }while(false);
-        }finally {
-              reader.unlock();
+    /**
+     * Update 'Res' into the map
+     *
+     * @param filename
+     * @param possibleLocations
+     */
+    private static Res updateRes(String filename, String[] possibleLocations) {
+        Res res = new Res(filename, possibleLocations);
+        long size = calculateFilesInCache();
+        if (size < MAX_FILE_IN_CACHE) {
+            int i = 0;
+            if (0 < possibleLocations.length) {
+                for (int len = possibleLocations.length; i < len; i++)
+                    FILES.put(Msc.path(possibleLocations[i], filename), res);
+            } else {
+                FILES.put(Msc.path(possibleLocations[i], filename), res);
+            }
         }
-  }
 
-  /*
-   * This method will resize the circular buffer
-   *
-   */
-  private static void resizeCircularArray() {
-    Lock writer = circularLock.writeLock();
-    writer.lock();
-    try {
-          int oldLength = circularLineQueue.length;
-          Res[] newCircularLineQueue = new Res[oldLength >>1 + oldLength];
+        sizeOfCachedFiles.add(size);
+        cachedFilesCount.incrementAndGet();
+        updatePlaceInLine(res);
 
-          int currentPos = circularLinePos.get(), toPos = 0;
-          currentPos = currentPos % oldLength;
-          for(int from = currentPos; from != currentPos; ) {
-              Res oldCachedRes = circularLineQueue[from];
-              if( oldCachedRes != null) {
+        return res;
+    }
+
+    private static long calculateFilesInCache() {
+        return FILES.size();
+    }
+
+    /**
+     * removes res from the map
+     *
+     * @param fileName
+     */
+    private static void removeRes(String fileName) {
+        FILES.remove(fileName);
+    }
+
+    /*
+     * This method updates the 'Res' object into the circular buffer
+     * If there is an existing entry, it will invalidate it and updates
+     * with the current one.
+     */
+    private static void updatePlaceInLine(Res res) {
+        Lock reader = circularLock.readLock();
+        reader.lock();
+        try {
+            do {
+                int newPos = circularLinePos.getAndIncrement();
+                newPos = newPos % circularLineQueue.length;
+                Res oldObject = circularLineQueue[newPos];
+                if (oldObject != null) {
+                    long cacheSizeSum = sizeOfCachedFiles.sum();
+                    boolean cacheSizeTooSmall = cacheSizeSum < MIN_CACHE_SIZE;
+                    boolean cacheProjectionSmallEnough = cacheSizeSum * circularLineQueue.length <= MAX_FILE_IN_CACHE * cachedFilesCount.getAndIncrement();
+                    if (cacheSizeTooSmall || cacheProjectionSmallEnough) {
+                        reader.unlock();
+                        resizeCircularArray();
+                        reader.lock();
+                        continue;
+                    }
+                    oldObject.invalidate();
+                }
+                circularLineQueue[newPos] = res;
+                if (placeInLine != -1) circularLineQueue[placeInLine] = null;
+                placeInLine = newPos;
+            } while (false);
+        } finally {
+            reader.unlock();
+        }
+    }
+
+
+    /*
+     * This method will resize the circular buffer
+     *
+     */
+    private static void resizeCircularArray() {
+        Lock writer = circularLock.writeLock();
+        writer.lock();
+        try {
+            int oldLength = circularLineQueue.length;
+            Res[] newCircularLineQueue = new Res[oldLength >> 1 + oldLength];
+
+            int currentPos = circularLinePos.get(), toPos = 0;
+            currentPos = currentPos % oldLength;
+            for (int from = currentPos; from != currentPos; ) {
+                Res oldCachedRes = circularLineQueue[from];
+                if (oldCachedRes != null) {
                     newCircularLineQueue[toPos] = oldCachedRes;
                     oldCachedRes.setPlaceInLine(toPos);
                     ++toPos;
-              }
-              if(++from == oldLength) from = 0;
-          }
-          
-          circularLinePos.set(toPos);
-          circularLineQueue = newCircularLineQueue;
-          
-          }finally {
-                  writer.unlock();
-          }
-  }
+                }
+                if (++from == oldLength) from = 0;
+            }
 
-	public synchronized byte[] getBytes() {
-		loadResource();
+            circularLinePos.set(toPos);
+            circularLineQueue = newCircularLineQueue;
 
-		mustExist();
-		return bytes;
-	}
+        } finally {
+            writer.unlock();
+        }
+    }
 
-	public byte[] getBytesOrNull() {
-		loadResource();
-		return bytes;
-	}
+    public static synchronized void reset() {
+        for (Res res : FILES.values()) {
+            res.invalidate();
+        }
+        FILES.clear();
+    }
 
-	protected void loadResource() {
-		// micro-caching the file content, expires after 500ms
-		if (U.timedOut(lastUpdatedOn, 500)) {
-			boolean hasChanged;
+    public static void setMaxCacheSize(int maxCacheSize) {
+        MAX_CACHE_SIZE = maxCacheSize;
+    }
 
-			synchronized (this) {
+    public static void setMinCacheSize(int minCacheSize) {
+        MIN_CACHE_SIZE = minCacheSize;
+    }
 
-				byte[] old = bytes;
-				byte[] foundRes = null;
+    public static void setMaxFileInCache(int maxFileInCache) {
+        MAX_FILE_IN_CACHE = maxFileInCache;
+    }
 
-				if (possibleLocations.length == 0) {
-					Log.trace("Trying to load the resource", "name", name);
+    private synchronized void setPlaceInLine(int place) { // setter
+        placeInLine = place;
+    }
 
-					byte[] res = load(name);
-					if (res != null) {
-						Log.debug("Loaded the resource", "name", name);
-						foundRes = res;
-						this.cachedFileName = name;
-					}
+    public synchronized byte[] getBytes() {
+        loadResource();
 
-				} else {
-					for (String location : possibleLocations) {
-						String filename = Msc.path(location, name);
+        mustExist();
+        return bytes;
+    }
 
-						Log.trace("Trying to load the resource", "name", name, "location", location, "filename", filename);
+    public byte[] getBytesOrNull() {
+        loadResource();
+        return bytes;
+    }
 
-						byte[] res = load(filename);
-						if (res != null) {
-							Log.debug("Loaded the resource", "name", name, "file", filename);
-							foundRes = res;
-							this.cachedFileName = filename;
-							break;
-						}
-					}
-				}
+    protected void loadResource() {
+        // micro-caching the file content, expires after 500ms
+        if (U.timedOut(lastUpdatedOn, 500)) {
+            boolean hasChanged;
 
-				if (foundRes == null) {
-					this.cachedFileName = null;
-				}
+            synchronized (this) {
 
-				this.bytes = foundRes;
-				hasChanged = !U.eq(old, bytes) && (old == null || bytes == null || !Arrays.equals(old, bytes));
-				lastUpdatedOn = U.time();
+                byte[] old = bytes;
+                byte[] foundRes = null;
 
-				if (hasChanged) {
-					content = null;
-					attachment = null;
-				}
-			}
+                if (possibleLocations.length == 0) {
+                    Log.trace("Trying to load the resource", "name", name);
 
-			if (hasChanged) {
-				notifyChangeListeners();
-			}
-		}
-	}
+                    byte[] res = load(name);
+                    if (res != null) {
+                        Log.debug("Loaded the resource", "name", name);
+                        foundRes = res;
+                        this.cachedFileName = name;
+                    }
 
-	protected byte[] load(String filename) {
-		File file = IO.file(filename);
+                } else {
+                    for (String location : possibleLocations) {
+                        String filename = Msc.path(location, name);
 
-		if (file.exists()) {
+                        Log.trace("Trying to load the resource", "name", name, "location", location, "filename", filename);
 
-			if (!file.isFile() || file.isDirectory()) {
-				return null;
-			}
+                        byte[] res = load(filename);
+                        if (res != null) {
+                            Log.debug("Loaded the resource", "name", name, "file", filename);
+                            foundRes = res;
+                            this.cachedFileName = filename;
+                            break;
+                        }
+                    }
+                }
 
-			// a normal file on the file system
-			Log.trace("Resource file exists", "name", name, "file", file);
+                if (foundRes == null) {
+                    this.cachedFileName = null;
+                }
 
-			long lastModif;
-			try {
-				lastModif = Files.getLastModifiedTime(file.toPath()).to(TimeUnit.MILLISECONDS);
+                this.bytes = foundRes;
+                hasChanged = !U.eq(old, bytes) && (old == null || bytes == null || !Arrays.equals(old, bytes));
+                lastUpdatedOn = U.time();
 
-			} catch (IOException e) {
-				// maybe it doesn't exist anymore
-				lastModif = U.time();
-			}
+                if (hasChanged) {
+                    content = null;
+                    attachment = null;
+                }
+            }
 
-			if (lastModif > this.lastModified || !filename.equals(cachedFileName)) {
-				Log.debug("Loading resource file", "name", name, "file", file);
-				this.lastModified = file.lastModified();
-				this.hidden = file.isHidden();
-				return IO.loadBytes(filename);
+            if (hasChanged) {
+                notifyChangeListeners();
+            }
+        }
+    }
 
-			} else {
-				Log.trace("Resource file not modified", "name", name, "file", file);
-				return bytes;
-			}
+    protected byte[] load(String filename) {
+        File file = IO.file(filename);
 
-		} else {
-			// it might not exist or it might be on the classpath or compressed in a JAR
-			Log.trace("Trying to load classpath resource", "name", name, "file", file);
-			this.hidden = false;
-			return IO.loadBytes(filename);
-		}
-	}
+        if (file.exists()) {
 
-	public synchronized String getContent() {
-		mustExist();
+            if (!file.isFile() || file.isDirectory()) {
+                return null;
+            }
 
-		if (content == null) {
-			byte[] b = getBytes();
-			content = b != null ? new String(b) : null;
-		}
+            // a normal file on the file system
+            Log.trace("Resource file exists", "name", name, "file", file);
 
-		return content;
-	}
+            long lastModif;
+            try {
+                lastModif = Files.getLastModifiedTime(file.toPath()).to(TimeUnit.MILLISECONDS);
 
-	public boolean exists() {
-		loadResource();
-		return bytes != null;
-	}
+            } catch (IOException e) {
+                // maybe it doesn't exist anymore
+                lastModif = U.time();
+            }
 
-	public String getName() {
-		return name;
-	}
+            if (lastModif > this.lastModified || !filename.equals(cachedFileName)) {
+                Log.debug("Loading resource file", "name", name, "file", file);
+                this.lastModified = file.lastModified();
+                this.hidden = file.isHidden();
+                return IO.loadBytes(filename);
 
-	@Override
-	public String toString() {
-		return "Res(" + name + ")";
-	}
+            } else {
+                Log.trace("Resource file not modified", "name", name, "file", file);
+                return bytes;
+            }
 
-	public synchronized Reader getReader() {
-		mustExist();
-		return new StringReader(getContent());
-	}
+        } else {
+            // it might not exist or it might be on the classpath or compressed in a JAR
+            Log.trace("Trying to load classpath resource", "name", name, "file", file);
+            this.hidden = false;
+            return IO.loadBytes(filename);
+        }
+    }
 
-	public Res mustExist() {
-		// IMPROVED 🌥️ error presentation: Removed the full path of the file and use only file name
-    U.must(exists(), "The file '%s' doesn't exist!", extractFileNameFromPath(name));
-		return this;
-	}
+    public synchronized String getContent() {
+        mustExist();
 
-	public Res onChange(String name, Runnable listener) {
-		changeListeners.put(name, listener);
-		return this;
-	}
+        if (content == null) {
+            byte[] b = getBytes();
+            content = b != null ? new String(b) : null;
+        }
 
-	public Res removeChangeListener(String name) {
-		changeListeners.remove(name);
-		return this;
-	}
+        return content;
+    }
 
-	private void notifyChangeListeners() {
-		if (!changeListeners.isEmpty()) {
-			Log.info("Resource has changed, reloading...", "name", name);
-		}
+    public boolean exists() {
+        loadResource();
+        return bytes != null;
+    }
 
-		for (Runnable listener : changeListeners.values()) {
-			try {
-				listener.run();
-			} catch (Throwable e) {
-				Log.error("Error while processing resource changes!", e);
-			}
-		}
-	}
+    public String getName() {
+        return name;
+    }
 
-	public synchronized Res trackChanges() {
-		if (!trackingChanges) {
-			this.trackingChanges = true;
-			// loading the resource causes the resource to check for changes
-			EXECUTOR.scheduleWithFixedDelay(this::loadResource, 0, 300, TimeUnit.MILLISECONDS);
-		}
+    @Override
+    public String toString() {
+        return "Res(" + name + ")";
+    }
 
-		return this;
-	}
+    public synchronized Reader getReader() {
+        mustExist();
+        return new StringReader(getContent());
+    }
 
-	@SuppressWarnings("unchecked")
-	public <T> T attachment() {
-		return exists() ? (T) attachment : null;
-	}
+    public Res mustExist() {
+        // IMPROVED 🌥️ error presentation: Removed the full path of the file and use only file name
+        U.must(exists(), "The file '%s' doesn't exist!", extractFileNameFromPath(name));
+        return this;
+    }
 
-	public void attach(Object attachment) {
-		this.attachment = attachment;
-	}
+    public Res onChange(String name, Runnable listener) {
+        changeListeners.put(name, listener);
+        return this;
+    }
 
-	public String getCachedFileName() {
-		return cachedFileName;
-	}
+    public Res removeChangeListener(String name) {
+        changeListeners.remove(name);
+        return this;
+    }
 
-	public static synchronized void reset() {
-		for (Res res : FILES.values()) {
-			res.invalidate();
-		}
-		FILES.clear();
-	}
+    private void notifyChangeListeners() {
+        if (!changeListeners.isEmpty()) {
+            Log.info("Resource has changed, reloading...", "name", name);
+        }
 
-	public void invalidate() {
-		lastUpdatedOn = 0;
-	}
+        for (Runnable listener : changeListeners.values()) {
+            try {
+                listener.run();
+            } catch (Throwable e) {
+                Log.error("Error while processing resource changes!", e);
+            }
+        }
+    }
 
-	public boolean isHidden() {
-		return hidden;
-	}
-  
-  	/**
-	 * remove the complete path from the file and
-	 * returns only file name at the time of displaying
-   * it on the client side
-	 * @param name
-	 * @return
-	 */
-	private String extractFileNameFromPath(String name) {
-		return new File(name).getName();
-	}
+    public synchronized Res trackChanges() {
+        if (!trackingChanges) {
+            this.trackingChanges = true;
+            // loading the resource causes the resource to check for changes
+            EXECUTOR.scheduleWithFixedDelay(this::loadResource, 0, 300, TimeUnit.MILLISECONDS);
+        }
+
+        return this;
+    }
+
+    public Res trackChanges(long interval) {
+        return trackChanges(interval, 0);
+    }
+
+    public synchronized Res trackChanges(long interval, long delay) {
+        if (filePollingTask == null)
+            // loading the resource causes the resource to check for changes
+            EXECUTOR.scheduleWithFixedDelay(
+                    this::loadResource, delay, interval, TimeUnit.MILLISECONDS);
+
+        return this;
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> T attachment() {
+        return exists() ? (T) attachment : null;
+    }
+
+    public void attach(Object attachment) {
+        this.attachment = attachment;
+    }
+
+    public String getCachedFileName() {
+        return cachedFileName;
+    }
+
+    public void invalidate() {
+        lastUpdatedOn = 0;
+        sizeOfCachedFiles.decrement();
+        cachedFilesCount.decrementAndGet();
+        if (filePollingTask != null) filePollingTask.cancel(false);
+    }
+
+    public boolean isHidden() {
+        return hidden;
+    }
+
+    /**
+     * remove the complete path from the file and
+     * returns only file name at the time of displaying
+     * it on the client side
+     *
+     * @param name
+     * @return
+     */
+    private String extractFileNameFromPath(String name) {
+        return new File(name).getName();
+    }
 
 }
