@@ -73,7 +73,7 @@ public class Res extends RapidoidThing {
     private static volatile int MIN_CACHE_SIZE = 4194304; //4 MB
     private static volatile int MAX_FILE_IN_CACHE = 1048576; // 1MB
     private static LongAdder sizeOfCachedFiles = new LongAdder();
-    private static volatile Res[] circularLineQueue = new Res[4096];
+    private static volatile Res[] circularLineQueue = new Res[256];
     private final String name;
     private final String[] possibleLocations;
     private final Map<String, Runnable> changeListeners = Coll.synchronizedMap();
